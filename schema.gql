@@ -1,0 +1,344 @@
+# ------------------------------------------------------
+# THIS FILE WAS AUTOMATICALLY GENERATED (DO NOT MODIFY)
+# ------------------------------------------------------
+
+input CreatePredictionInput {
+  amount: Float
+  confidence: Float!
+  gameId: String!
+  predictedOutcome: String!
+}
+
+type DashboardStats {
+  activeUsers: Int!
+  liveGames: Int!
+  todayPredictions: Int!
+  totalGames: Int!
+  totalPayouts: Float!
+  totalPredictions: Int!
+  totalRevenue: Float!
+  totalUsers: Int!
+}
+
+"""
+A date-time string at UTC, such as 2019-12-03T09:54:33Z, compliant with the date-time format.
+"""
+scalar DateTime
+
+type Game {
+  awayOdds: Float
+  awayTeam: Team!
+  createdAt: DateTime!
+  drawOdds: Float
+  externalId: String
+  headToHead: HeadToHead
+  homeOdds: Float
+  homeTeam: Team!
+  id: ID!
+  isFree: Boolean!
+  league: String!
+  sport: String!
+  startTime: DateTime!
+  statistics: GameStatistics
+  status: String!
+  teamForm: TeamForm
+  tipConfidence: Float
+  tipOutcome: String
+  tipText: String
+  totalPredictions: Int!
+  updatedAt: DateTime!
+  venue: String
+}
+
+type GameStatistics {
+  corners: StatPair
+  fouls: StatPair
+  offsides: StatPair
+  possession: StatPair
+  redCards: StatPair
+  shots: StatPair
+  shotsOnTarget: StatPair
+  yellowCards: StatPair
+}
+
+input GameStatisticsInput {
+  corners: StatPairInput
+  fouls: StatPairInput
+  offsides: StatPairInput
+  possession: StatPairInput
+  redCards: StatPairInput
+  shots: StatPairInput
+  shotsOnTarget: StatPairInput
+  yellowCards: StatPairInput
+}
+
+type HeadToHead {
+  awayWins: Int
+  draws: Int
+  homeWins: Int
+  lastMatches: [HeadToHeadMatch!]
+}
+
+input HeadToHeadInput {
+  awayWins: Int
+  draws: Int
+  homeWins: Int
+  lastMatches: [HeadToHeadMatchInput!]
+}
+
+type HeadToHeadMatch {
+  awayTeam: String!
+  date: String!
+  homeTeam: String!
+  score: String!
+}
+
+input HeadToHeadMatchInput {
+  awayTeam: String!
+  date: String!
+  homeTeam: String!
+  score: String!
+}
+
+input InitializePaymentInput {
+  amount: Float!
+  metadata: String
+  planName: String!
+}
+
+input LoginInput {
+  email: String!
+  password: String!
+}
+
+type LoginResponse {
+  access_token: String!
+  user: User!
+}
+
+type MessageResponse {
+  message: String!
+  success: Boolean
+}
+
+type Mutation {
+  applyReferralCode(referralCode: String!): Boolean!
+  createPrediction(input: CreatePredictionInput!): Prediction!
+  forgotPassword(email: String!): MessageResponse!
+  generateReferralCode: String!
+  initializePaystackPayment(input: InitializePaymentInput!): PaymentInitResponse!
+  login(input: LoginInput!): LoginResponse!
+  register(input: RegisterInput!): MessageResponse!
+  removeGameTip(gameId: String!): Game!
+  resendPhoneOTP(phone: String!): MessageResponse!
+  resetPassword(password: String!, token: String!): MessageResponse!
+  sendBulkSms(message: String!, userIds: [String!]!): MessageResponse!
+  sendEmailOtp(input: SendEmailOtpInput!): MessageResponse!
+  sendPhoneOtpToCurrentUser: MessageResponse!
+  sendSmsToAllUsers(message: String!): MessageResponse!
+  sendSmsToUser(input: SendSmsInput!): MessageResponse!
+  syncApiFootballFixtures: SyncResult!
+  updateGameStatistics(input: UpdateGameStatisticsInput!): Game!
+  updateGameTip(input: UpdateGameTipInput!): Game!
+  updateNotificationSettings(emailNotifications: Boolean, smsNotifications: Boolean): Boolean!
+  updateProfile(input: UpdateUserInput!): User!
+  verifyEmail(token: String!): MessageResponse!
+  verifyEmailOtp(input: VerifyEmailOtpInput!): LoginResponse!
+  verifyPhone(input: VerifyPhoneInput!): MessageResponse!
+  verifyPhoneForCurrentUser(code: String!): MessageResponse!
+}
+
+type Payment {
+  amount: Float!
+  createdAt: DateTime!
+  currency: String!
+  description: String
+  id: ID!
+  invoiceNumber: String
+  method: String!
+  reference: String
+  status: String!
+  subscriptionDurationMonths: Float
+  subscriptionPlan: String
+  transactionId: String
+  type: String!
+  updatedAt: DateTime!
+  user: User!
+}
+
+type PaymentInitResponse {
+  access_code: String!
+  authorization_url: String!
+  reference: String!
+}
+
+type Prediction {
+  amount: Float
+  confidence: Float!
+  createdAt: DateTime!
+  game: Game!
+  id: ID!
+  payout: Float
+  predictedOutcome: String!
+  result: String
+  status: String!
+  updatedAt: DateTime!
+  user: User!
+}
+
+type PredictionStats {
+  correctPredictions: Int!
+  incorrectPredictions: Int!
+  netProfit: Float!
+  pendingPredictions: Int!
+  totalLosses: Float!
+  totalPredictions: Int!
+  totalWinnings: Float!
+  winRate: Float!
+}
+
+type Query {
+  adminDashboard: DashboardStats!
+  allGames: [Game!]!
+  allPayments: [Payment!]!
+  completedGames(limit: Float! = 20): [Game!]!
+  game(id: String!): Game!
+  gamePredictions(gameId: String!): [Prediction!]!
+  gamesBySport(sport: String!, status: String): [Game!]!
+  gamesWithFreeTips: [Game!]!
+  generateInvoice(paymentId: String!): String!
+  leaderboard(limit: Int! = 10): [Prediction!]!
+  liveGames: [Game!]!
+  me: User!
+  myPayments: [Payment!]!
+  myPredictionStats: PredictionStats!
+  myPredictions: [Prediction!]!
+  paymentStatus(paymentId: String!): Payment!
+  testAuth: String!
+  upcomingGames: [Game!]!
+  user(id: String!): User!
+  users: [User!]!
+  verifyPaystackPayment(reference: String!): Payment!
+}
+
+input RegisterInput {
+  email: String
+  firstName: String!
+  lastName: String!
+  password: String!
+  phone: String!
+  referralCode: String
+}
+
+input SendEmailOtpInput {
+  email: String!
+}
+
+input SendSmsInput {
+  message: String!
+  userId: String!
+}
+
+type StatPair {
+  away: Int!
+  home: Int!
+}
+
+input StatPairInput {
+  away: Int!
+  home: Int!
+}
+
+type Subscription {
+  gameStatusChanged: Game!
+  gameUpdated(gameId: String): Game!
+}
+
+type SyncResult {
+  message: String!
+  success: Boolean!
+}
+
+type Team {
+  logo: String
+  name: String!
+  score: Int
+}
+
+type TeamForm {
+  away: [String!]
+  home: [String!]
+}
+
+input TeamFormInput {
+  away: [String!]
+  home: [String!]
+}
+
+input UpdateGameStatisticsInput {
+  gameId: String!
+  headToHead: HeadToHeadInput
+  statistics: GameStatisticsInput
+  teamForm: TeamFormInput
+}
+
+input UpdateGameTipInput {
+  gameId: String!
+  isFree: Boolean!
+  tipConfidence: Float
+  tipOutcome: String
+  tipText: String
+}
+
+input UpdateUserInput {
+  avatar: String
+  email: String
+  firstName: String
+  fullName: String
+  lastName: String
+  phone: String
+  referralPoints: Int
+  totalReferrals: Int
+}
+
+type User {
+  avatar: String
+  balance: Float!
+  correctPredictions: Int!
+  createdAt: DateTime!
+  email: String
+  emailNotifications: Boolean!
+  emailVerified: Boolean!
+  firstName: String
+  fullName: String
+  id: ID!
+  lastName: String
+  payments: [Payment!]
+  phone: String!
+  phoneVerified: Boolean!
+  predictions: [Prediction!]
+  referralCode: String
+  referralPoints: Int!
+  referralValue: Float!
+  referredBy: String
+  role: String!
+  smsNotifications: Boolean!
+  subscriptionEndDate: DateTime
+  subscriptionPlan: String
+  subscriptionStartDate: DateTime
+  subscriptionStatus: String!
+  totalPredictions: Int!
+  totalReferrals: Int!
+  updatedAt: DateTime!
+  winRate: Float!
+}
+
+input VerifyEmailOtpInput {
+  email: String!
+  otp: String!
+}
+
+input VerifyPhoneInput {
+  code: String!
+  phone: String!
+}

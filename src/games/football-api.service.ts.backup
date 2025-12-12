@@ -1,0 +1,736 @@
+import { Injectable, Logger } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
+import { InjectRepository } from '@nestjs/typeorm';
+import { Repository } from 'typeorm';
+import { Game, GameStatus } from './entities/game.entity';
+import { Cron, CronExpression } from '@nestjs/schedule';
+import * as https from 'https';
+import * as http from 'http';
+
+interface ApiFootballFixture {
+  fixture: {
+    id: number;
+    date: string;
+    status: {
+      long: string;
+      short: string;
+    };
+  };
+  league: {
+    id: number;
+    name: string;
+    country: string;
+    logo: string;
+  };
+  teams: {
+    home: {
+      id: number;
+      name: string;
+      logo: string;
+    };
+    away: {
+      id: number;
+      name: string;
+      logo: string;
+    };
+  };
+  goals: {
+    home: number | null;
+    away: number | null;
+  };
+  score: {
+    halftime: {
+      home: number | null;
+      away: number | null;
+    };
+    fulltime: {
+      home: number | null;
+      away: number | null;
+    };
+  };
+}
+
+@Injectable()
+export class FootballApiService {
+  private readonly logger = new Logger(FootballApiService.name);
+  private readonly baseUrl = 'https://www.thesportsdb.com/api/v1/json/3';
+  private isApiHealthy = true;
+  private lastHealthCheck = Date.now();
+
+  constructor(
+    private configService: ConfigService,
+    @InjectRepository(Game)
+    private gamesRepository: Repository<Game>,
+  ) {
+    this.logger.log('✅ TheSportsDB API initialized (no key required)');
+    // Run initial health check and sync
+    this.initializeService();
+  }
+
+  // Initialize service with health check and initial sync
+  private async initializeService() {
+    await this.checkApiHealth();
+    await this.updateExistingGamesWithStatistics();
+
+    if (this.isApiHealthy) {
+      // Run initial sync after 5 seconds to allow app to fully start
+      setTimeout(async () => {
+        this.logger.log('🚀 Running initial fixtures sync...');
+        await this.syncTodaysFixtures();
+      }, 5000);
+    }
+  }
+
+  // Update existing games without statistics
+  private async updateExistingGamesWithStatistics(): Promise<void> {
+    try {
+      const gamesWithoutStats = await this.gamesRepository
+        .createQueryBuilder('game')
+        .where('game.statistics IS NULL')
+        .getMany();
+
+      if (gamesWithoutStats.length > 0) {
+        this.logger.log(
+          `📊 Adding statistics to ${gamesWithoutStats.length} games without data...`,
+        );
+
+        for (const game of gamesWithoutStats) {
+          await this.gamesRepository.update(game.id, {
+            statistics: this.generateSampleStatistics(),
+            teamForm: this.generateSampleTeamForm(),
+            headToHead: this.generateSampleHeadToHead(
+              game.homeTeam?.name,
+              game.awayTeam?.name,
+            ),
+          });
+        }
+
+        this.logger.log(
+          `✅ Added statistics to ${gamesWithoutStats.length} games`,
+        );
+      }
+    } catch (error) {
+      this.logger.error(
+        `Failed to update games with statistics: ${error.message}`,
+      );
+    }
+  }
+
+  // Check if the API is accessible
+  private async checkApiHealth(): Promise<boolean> {
+    try {
+      // Use fetchWithHttps which handles IPv4 properly
+      const testUrl = `${this.baseUrl}/eventsnextleague.php?id=4328`;
+      const data = await this.fetchWithHttps(testUrl);
+
+      this.isApiHealthy = !!data;
+      this.lastHealthCheck = Date.now();
+
+      if (this.isApiHealthy) {
+        this.logger.log('✅ API health check passed');
+      } else {
+        this.logger.warn('⚠️  API health check failed: No data received');
+      }
+
+      return this.isApiHealthy;
+    } catch (error) {
+      this.isApiHealthy = false;
+      this.lastHealthCheck = Date.now();
+      this.logger.error(`❌ API health check failed: ${error.message}`);
+      return false;
+    }
+  }
+
+  // Fallback fetch using Node's https module (IPv4 preferred)
+  private fetchWithHttps(url: string): Promise<any> {
+    return new Promise((resolve, reject) => {
+      const urlObj = new URL(url);
+      const options = {
+        hostname: urlObj.hostname,
+        path: urlObj.pathname + urlObj.search,
+        method: 'GET',
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (compatible; JaneOnTheGame/1.0)',
+        },
+        timeout: 10000,
+        family: 4, // Force IPv4 to avoid IPv6 connection issues
+      };
+
+      const req = https.request(options, (res) => {
+        let data = '';
+
+        res.on('data', (chunk) => {
+          data += chunk;
+        });
+
+        res.on('end', () => {
+          try {
+            resolve(JSON.parse(data));
+          } catch (error) {
+            reject(new Error(`Failed to parse JSON: ${error.message}`));
+          }
+        });
+      });
+
+      req.on('error', (error) => {
+        reject(error);
+      });
+
+      req.on('timeout', () => {
+        req.destroy();
+        reject(new Error('Request timeout'));
+      });
+
+      req.end();
+    });
+  }
+
+  // Fetch fixtures from TheSportsDB with retry logic
+  private async fetchFixtures(
+    params: {
+      date?: string;
+      leagueId?: string;
+    },
+    retries = 2,
+  ): Promise<ApiFootballFixture[]> {
+    let url: string;
+
+    if (params.date) {
+      // Get events for a specific date
+      url = `${this.baseUrl}/eventsday.php?d=${params.date}&s=Soccer`;
+    } else if (params.leagueId) {
+      // Get next 15 events for a league
+      url = `${this.baseUrl}/eventsnextleague.php?id=${params.leagueId}`;
+    } else {
+      // Default: get today's soccer events
+      const today = new Date().toISOString().split('T')[0];
+      url = `${this.baseUrl}/eventsday.php?d=${today}&s=Soccer`;
+    }
+
+    for (let attempt = 1; attempt <= retries; attempt++) {
+      try {
+        this.logger.debug(
+          `Fetching from: ${url} (attempt ${attempt}/${retries})`,
+        );
+
+        let data: any;
+
+        try {
+          // Try with fetch first
+          const controller = new AbortController();
+          const timeout = setTimeout(() => controller.abort(), 10000);
+
+          const response = await fetch(url, {
+            method: 'GET',
+            signal: controller.signal,
+            headers: {
+              'User-Agent': 'Mozilla/5.0 (compatible; JaneOnTheGame/1.0)',
+            },
+          });
+
+          clearTimeout(timeout);
+
+          if (!response.ok) {
+            throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+          }
+
+          data = await response.json();
+        } catch (fetchError) {
+          // Fallback to https module
+          this.logger.warn(
+            `Fetch failed (${fetchError.message}), trying https module...`,
+          );
+          data = await this.fetchWithHttps(url);
+        }
+
+        // Log raw data for debugging
+        if (data.events && data.events.length > 0) {
+          this.logger.log(`📥 Received ${data.events.length} events from API`);
+          data.events.slice(0, 3).forEach((event: any) => {
+            this.logger.debug(
+              `  Match: ${event.strHomeTeam} vs ${event.strAwayTeam} - ${event.strStatus || 'Not Started'}`,
+            );
+          });
+        } else {
+          this.logger.warn('⚠️  No events returned from API');
+        }
+
+        // Map TheSportsDB format to our expected format
+        return this.mapSportsDBEvents(data.events || []);
+      } catch (error) {
+        const isLastAttempt = attempt === retries;
+
+        if (error.name === 'AbortError') {
+          this.logger.warn(`Request timeout (attempt ${attempt}/${retries})`);
+        } else {
+          this.logger.error(
+            `Failed to fetch fixtures (attempt ${attempt}/${retries}): ${error.message}`,
+          );
+        }
+
+        if (isLastAttempt) {
+          this.logger.error(
+            `❌ All ${retries} attempts failed. Returning empty results.`,
+          );
+          this.logger.error(
+            `💡 Check your internet connection or try: curl -v ${url}`,
+          );
+          return [];
+        }
+
+        // Wait before retrying (exponential backoff)
+        const delay = Math.min(1000 * Math.pow(2, attempt - 1), 5000);
+        this.logger.debug(`Waiting ${delay}ms before retry...`);
+        await new Promise((resolve) => setTimeout(resolve, delay));
+      }
+    }
+
+    return [];
+  }
+
+  // Map TheSportsDB events to our expected format
+  private mapSportsDBEvents(events: any[]): ApiFootballFixture[] {
+    const yesterday = new Date();
+    yesterday.setDate(yesterday.getDate() - 1);
+    yesterday.setHours(0, 0, 0, 0);
+
+    return events
+      .filter((event) => {
+        if (event.strSport !== 'Soccer') return false;
+
+        // Filter out old matches (before yesterday)
+        const matchDate = new Date(event.strTimestamp || event.dateEvent);
+        if (matchDate < yesterday) {
+          this.logger.debug(
+            `Skipping old match from ${matchDate.toISOString()}: ${event.strHomeTeam} vs ${event.strAwayTeam}`,
+          );
+          return false;
+        }
+
+        return true;
+      })
+      .map((event) => ({
+        fixture: {
+          id: parseInt(event.idEvent),
+          date: event.strTimestamp || event.dateEvent,
+          status: {
+            long: event.strStatus || 'Not Started',
+            short: this.mapSportsDBStatus(event.strStatus),
+          },
+        },
+        league: {
+          id: parseInt(event.idLeague),
+          name: event.strLeague,
+          country: event.strCountry || 'International',
+          logo: event.strLeagueBadge || '',
+        },
+        teams: {
+          home: {
+            id: parseInt(event.idHomeTeam),
+            name: event.strHomeTeam,
+            logo: event.strHomeTeamBadge || '',
+          },
+          away: {
+            id: parseInt(event.idAwayTeam),
+            name: event.strAwayTeam,
+            logo: event.strAwayTeamBadge || '',
+          },
+        },
+        goals: {
+          home: event.intHomeScore ? parseInt(event.intHomeScore) : null,
+          away: event.intAwayScore ? parseInt(event.intAwayScore) : null,
+        },
+        score: {
+          halftime: {
+            home: null,
+            away: null,
+          },
+          fulltime: {
+            home: event.intHomeScore ? parseInt(event.intHomeScore) : null,
+            away: event.intAwayScore ? parseInt(event.intAwayScore) : null,
+          },
+        },
+      }));
+  }
+
+  // Map TheSportsDB status to short codes
+  private mapSportsDBStatus(status: string): string {
+    if (!status) return 'NS';
+    const statusMap: Record<string, string> = {
+      'Not Started': 'NS',
+      'Match Finished': 'FT',
+      FT: 'FT',
+      Postponed: 'PST',
+      Cancelled: 'CANC',
+      'In Progress': '2H',
+      'Half Time': 'HT',
+    };
+    return statusMap[status] || 'NS';
+  }
+
+  // Map API-Football status to our GameStatus
+  private mapStatus(apiStatus: string): GameStatus {
+    const statusMap: Record<string, GameStatus> = {
+      TBD: GameStatus.SCHEDULED,
+      NS: GameStatus.SCHEDULED, // Not Started
+      '1H': GameStatus.LIVE, // First Half
+      HT: GameStatus.LIVE, // Halftime
+      '2H': GameStatus.LIVE, // Second Half
+      ET: GameStatus.LIVE, // Extra Time
+      P: GameStatus.LIVE, // Penalty
+      FT: GameStatus.COMPLETED, // Full Time
+      AET: GameStatus.COMPLETED, // After Extra Time
+      PEN: GameStatus.COMPLETED, // Penalties
+      PST: GameStatus.POSTPONED,
+      CANC: GameStatus.CANCELLED,
+      ABD: GameStatus.CANCELLED, // Abandoned
+      AWD: GameStatus.COMPLETED, // Technical Loss
+      WO: GameStatus.COMPLETED, // WalkOver
+    };
+
+    return statusMap[apiStatus] || GameStatus.SCHEDULED;
+  }
+
+  // Convert API-Football fixture to our Game entity
+  private mapFixtureToGame(fixture: ApiFootballFixture): Partial<Game> {
+    return {
+      externalId: fixture.fixture.id.toString(),
+      sport: 'Football',
+      league: `${fixture.league.name} (${fixture.league.country})`,
+      homeTeam: {
+        name: fixture.teams.home.name,
+        logo: fixture.teams.home.logo,
+        score: fixture.goals.home ?? undefined,
+      },
+      awayTeam: {
+        name: fixture.teams.away.name,
+        logo: fixture.teams.away.logo,
+        score: fixture.goals.away ?? undefined,
+      },
+      startTime: new Date(fixture.fixture.date),
+      status: this.mapStatus(fixture.fixture.status.short),
+      venue: null,
+      homeOdds: null,
+      awayOdds: null,
+      drawOdds: null,
+    };
+  }
+
+  // Sync today's fixtures (using league-based approach for better data)
+  async syncTodaysFixtures(): Promise<void> {
+    this.logger.log('🔄 Syncing upcoming fixtures from popular leagues...');
+
+    // TheSportsDB's eventsnextleague has more reliable data than eventsday
+    const popularLeagues = [
+      { id: 4328, name: 'Premier League' },
+      { id: 4335, name: 'La Liga' },
+      { id: 4331, name: 'Bundesliga' },
+      { id: 4332, name: 'Serie A' },
+      { id: 4334, name: 'Ligue 1' },
+      { id: 4480, name: 'Champions League' },
+      { id: 4481, name: 'Europa League' },
+    ];
+
+    let totalFixtures = 0;
+
+    for (const league of popularLeagues) {
+      try {
+        const fixtures = await this.fetchFixtures({
+          leagueId: league.id.toString(),
+        });
+
+        if (fixtures.length > 0) {
+          this.logger.log(
+            `  📊 ${league.name}: ${fixtures.length} upcoming matches`,
+          );
+
+          for (const fixture of fixtures) {
+            await this.syncFixture(fixture);
+            totalFixtures++;
+          }
+        }
+
+        // Add delay between leagues to avoid rate limiting (500ms)
+        await new Promise((resolve) => setTimeout(resolve, 500));
+      } catch (error) {
+        this.logger.warn(
+          `  ⚠️  Failed to sync ${league.name}: ${error.message}`,
+        );
+      }
+    }
+
+    this.logger.log(`✅ Sync completed - ${totalFixtures} total fixtures`);
+  }
+
+  // Sync a specific league's fixtures
+  async syncLeagueFixtures(leagueId: number, season: number): Promise<void> {
+    this.logger.log(`🔄 Syncing fixtures for league ${leagueId}...`);
+
+    const fixtures = await this.fetchFixtures({
+      leagueId: leagueId.toString(),
+    });
+
+    this.logger.log(`📊 Found ${fixtures.length} fixtures`);
+
+    for (const fixture of fixtures) {
+      await this.syncFixture(fixture);
+    }
+
+    this.logger.log('✅ Sync completed');
+  }
+
+  // Sync live fixtures by checking existing scheduled games
+  async syncLiveFixtures(): Promise<void> {
+    this.logger.log('🔄 Checking for live match updates...');
+
+    // Get all scheduled and live games from our database
+    const activeGames = await this.gamesRepository.find({
+      where: [{ status: GameStatus.SCHEDULED }, { status: GameStatus.LIVE }],
+      take: 50, // Limit to prevent too many API calls
+    });
+
+    if (activeGames.length === 0) {
+      this.logger.log('📊 No active games to check');
+      return;
+    }
+
+    this.logger.log(
+      `📊 Checking ${activeGames.length} active games for updates`,
+    );
+
+    // Group by league to minimize API calls
+    const leagueIds = new Set(
+      activeGames
+        .map((game) => {
+          // Extract league ID from externalId or use popular leagues
+          return null;
+        })
+        .filter((id) => id !== null),
+    );
+
+    // If we can't determine leagues, just check popular ones
+    const popularLeagues = [4328, 4335, 4331, 4332, 4334, 4480, 4481];
+
+    for (const leagueId of popularLeagues) {
+      try {
+        const fixtures = await this.fetchFixtures({
+          leagueId: leagueId.toString(),
+        });
+
+        // Update any matches that exist in our DB
+        for (const fixture of fixtures) {
+          const externalId = fixture.fixture.id.toString();
+          const existingGame = activeGames.find(
+            (g) => g.externalId === externalId,
+          );
+
+          if (existingGame) {
+            await this.syncFixture(fixture);
+
+            if (
+              fixture.fixture.status.short === '2H' ||
+              fixture.fixture.status.short === 'HT'
+            ) {
+              this.logger.log(
+                `  🔴 LIVE: ${fixture.teams.home.name} ${fixture.goals.home ?? 0} - ${fixture.goals.away ?? 0} ${fixture.teams.away.name}`,
+              );
+            }
+          }
+        }
+      } catch (error) {
+        // Silent fail for individual leagues
+      }
+    }
+
+    this.logger.log('✅ Live check completed');
+  }
+
+  // Sync a single fixture
+  private async syncFixture(fixture: ApiFootballFixture): Promise<void> {
+    const externalId = fixture.fixture.id.toString();
+
+    // Check if game already exists
+    const existingGame = await this.gamesRepository.findOne({
+      where: { externalId },
+    });
+
+    const gameData = this.mapFixtureToGame(fixture);
+
+    if (existingGame) {
+      // Update existing game
+      await this.gamesRepository.update(existingGame.id, gameData);
+      this.logger.debug(
+        `Updated game: ${gameData.homeTeam?.name} vs ${gameData.awayTeam?.name}`,
+      );
+    } else {
+      // Create new game with sample statistics
+      const newGame = this.gamesRepository.create({
+        ...gameData,
+        statistics: this.generateSampleStatistics(),
+        teamForm: this.generateSampleTeamForm(),
+        headToHead: this.generateSampleHeadToHead(
+          gameData.homeTeam?.name,
+          gameData.awayTeam?.name,
+        ),
+      });
+      await this.gamesRepository.save(newGame);
+      this.logger.debug(
+        `Created game with statistics: ${gameData.homeTeam?.name} vs ${gameData.awayTeam?.name}`,
+      );
+    }
+  }
+
+  // Generate sample statistics
+  private generateSampleStatistics() {
+    return {
+      possession: {
+        home: Math.floor(Math.random() * 30) + 40,
+        away: Math.floor(Math.random() * 30) + 40,
+      },
+      shots: {
+        home: Math.floor(Math.random() * 10) + 5,
+        away: Math.floor(Math.random() * 10) + 5,
+      },
+      shotsOnTarget: {
+        home: Math.floor(Math.random() * 5) + 2,
+        away: Math.floor(Math.random() * 5) + 2,
+      },
+      corners: {
+        home: Math.floor(Math.random() * 6) + 2,
+        away: Math.floor(Math.random() * 6) + 2,
+      },
+      fouls: {
+        home: Math.floor(Math.random() * 8) + 5,
+        away: Math.floor(Math.random() * 8) + 5,
+      },
+      yellowCards: {
+        home: Math.floor(Math.random() * 3),
+        away: Math.floor(Math.random() * 3),
+      },
+      redCards: {
+        home: Math.floor(Math.random() * 2),
+        away: Math.floor(Math.random() * 2),
+      },
+      offsides: {
+        home: Math.floor(Math.random() * 4),
+        away: Math.floor(Math.random() * 4),
+      },
+    };
+  }
+
+  // Generate sample team form
+  private generateSampleTeamForm() {
+    const forms = ['W', 'D', 'L'];
+    const generateForm = () =>
+      Array.from(
+        { length: 5 },
+        () => forms[Math.floor(Math.random() * forms.length)],
+      );
+    return {
+      home: generateForm(),
+      away: generateForm(),
+    };
+  }
+
+  // Generate sample head to head
+  private generateSampleHeadToHead(homeTeam?: string, awayTeam?: string) {
+    const homeWins = Math.floor(Math.random() * 5);
+    const awayWins = Math.floor(Math.random() * 5);
+    const draws = Math.floor(Math.random() * 3);
+
+    return {
+      homeWins,
+      draws,
+      awayWins,
+      lastMatches: [
+        {
+          date: '2024-08-15',
+          homeTeam: homeTeam || 'Home',
+          awayTeam: awayTeam || 'Away',
+          score: `${Math.floor(Math.random() * 4)}-${Math.floor(Math.random() * 4)}`,
+        },
+        {
+          date: '2024-03-10',
+          homeTeam: awayTeam || 'Away',
+          awayTeam: homeTeam || 'Home',
+          score: `${Math.floor(Math.random() * 4)}-${Math.floor(Math.random() * 4)}`,
+        },
+        {
+          date: '2023-11-20',
+          homeTeam: homeTeam || 'Home',
+          awayTeam: awayTeam || 'Away',
+          score: `${Math.floor(Math.random() * 4)}-${Math.floor(Math.random() * 4)}`,
+        },
+      ],
+    };
+  }
+
+  // Clean up old matches (older than 7 days)
+  async cleanupOldMatches(): Promise<void> {
+    const sevenDaysAgo = new Date();
+    sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7);
+
+    const result = await this.gamesRepository
+      .createQueryBuilder()
+      .delete()
+      .where('startTime < :date', { date: sevenDaysAgo })
+      .andWhere('status = :status', { status: GameStatus.COMPLETED })
+      .execute();
+
+    if (result.affected && result.affected > 0) {
+      this.logger.log(`🗑️  Cleaned up ${result.affected} old matches`);
+    }
+  }
+
+  // Cron job: Sync upcoming fixtures every 5 minutes to avoid rate limiting
+  @Cron(CronExpression.EVERY_5_MINUTES)
+  async scheduledTodaysSync() {
+    await this.syncTodaysFixtures();
+  }
+
+  // Cron job: Sync live fixtures every 2 minutes for score updates
+  @Cron('*/2 * * * *')
+  async scheduledLiveSync() {
+    await this.syncLiveFixtures();
+  }
+
+  // Cron job: Sync popular leagues and cleanup at midnight every day
+  @Cron(CronExpression.EVERY_DAY_AT_MIDNIGHT)
+  async scheduledLeaguesSync() {
+    this.logger.log('🔄 Running daily maintenance...');
+
+    // Clean up old matches first
+    await this.cleanupOldMatches();
+
+    // TheSportsDB league IDs
+    const popularLeagues = [
+      4328, // English Premier League
+      4335, // Spanish La Liga
+      4331, // German Bundesliga
+      4332, // Italian Serie A
+      4334, // French Ligue 1
+      4480, // UEFA Champions League
+      4481, // UEFA Europa League
+    ];
+
+    for (const leagueId of popularLeagues) {
+      try {
+        await this.syncLeagueFixtures(leagueId, 0);
+      } catch (error) {
+        this.logger.error(`Failed to sync league ${leagueId}:`, error.message);
+      }
+    }
+
+    this.logger.log('✅ Daily maintenance completed');
+  }
+
+  // Popular league IDs for TheSportsDB:
+  // 4328 - English Premier League
+  // 4335 - Spanish La Liga
+  // 4331 - German Bundesliga
+  // 135 - Serie A (Italy)
+  // 61 - Ligue 1 (France)
+  // 2 - UEFA Champions League
+  // 3 - UEFA Europa League
+  // 848 - UEFA Europa Conference League
+}

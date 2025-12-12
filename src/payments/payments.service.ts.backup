@@ -1,0 +1,411 @@
+import { Injectable } from '@nestjs/common';
+import { InjectRepository } from '@nestjs/typeorm';
+import { Repository } from 'typeorm';
+import { Payment } from './entities/payment.entity';
+import { UsersService } from '../users/users.service';
+
+@Injectable()
+export class PaymentsService {
+  constructor(
+    @InjectRepository(Payment)
+    private paymentsRepository: Repository<Payment>,
+    private usersService: UsersService,
+  ) {}
+
+  async getAccessToken(): Promise<string> {
+    const consumerKey = this.configService.get('MPESA_CONSUMER_KEY');
+    const consumerSecret = this.configService.get('MPESA_CONSUMER_SECRET');
+
+    const auth = Buffer.from(`${consumerKey}:${consumerSecret}`).toString(
+      'base64',
+    );
+
+    console.log('🔍 M-Pesa Auth Debug:');
+    console.log('- Base URL:', this.mpesaBaseUrl);
+    console.log('- Consumer Key:', consumerKey?.substring(0, 10) + '...');
+    console.log('- Consumer Secret:', consumerSecret?.substring(0, 10) + '...');
+    
+    try {
+      const response = await axios.get(
+        `${this.mpesaBaseUrl}/oauth/v1/generate?grant_type=client_credentials`,
+        {
+          headers: {
+            Authorization: `Basic ${auth}`,
+          },
+        },
+      );
+
+      console.log('✅ M-Pesa auth successful');
+      return response.data.access_token;
+    } catch (error) {
+      console.error('❌ M-Pesa auth error:');
+      console.error('Status:', error.response?.status);
+      console.error('Data:', JSON.stringify(error.response?.data, null, 2));
+      console.error('Message:', error.message);
+      throw new BadRequestException('Failed to authenticate with M-Pesa');
+    }
+  }
+
+  async createDeposit(
+    userId: string,
+    amount: number,
+    phone: string,
+    plan?: string,
+    durationMonths?: number,
+    useReferralPoints?: number,
+  ): Promise<Payment> {
+    let finalAmount = amount;
+    let discountApplied = 0;
+
+    // Apply referral points discount if requested
+    if (useReferralPoints && useReferralPoints > 0) {
+      try {
+        const discountValue = await this.usersService.useReferralPoints(
+          userId,
+          useReferralPoints,
+        );
+        discountApplied = discountValue;
+        finalAmount = Math.max(0, amount - discountValue);
+      } catch (error) {
+        console.error('Referral points error:', error.message);
+        throw new BadRequestException(error.message);
+      }
+    }
+
+    // Generate invoice number
+    const timestamp = Date.now();
+    const invoiceNumber = `INV-${timestamp}`;
+
+    const payment = this.paymentsRepository.create({
+      userId,
+      amount: finalAmount,
+      type: PaymentType.DEPOSIT,
+      method: PaymentMethod.MPESA,
+      status: PaymentStatus.PENDING,
+      invoiceNumber,
+      subscriptionPlan: plan || null,
+      subscriptionDurationMonths: durationMonths || null,
+      description: plan
+        ? `${plan} subscription - ${durationMonths} month(s)${discountApplied > 0 ? ` (KSH ${discountApplied} referral discount)` : ''}`
+        : 'Deposit',
+    });
+
+    const saved = await this.paymentsRepository.save(payment);
+
+    // Initiate M-Pesa STK Push (don't fail if this errors - payment is already created)
+    try {
+      await this.initiateStkPush(saved.id, phone, finalAmount);
+    } catch (error) {
+      console.error('STK Push error (payment still created):', error.message);
+      // Don't throw - payment is created, just STK push failed
+    }
+
+    // Load the user relation before returning
+    const paymentWithUser = await this.paymentsRepository.findOne({
+      where: { id: saved.id },
+      relations: ['user'],
+    });
+
+    if (!paymentWithUser) {
+      throw new BadRequestException('Payment not found after creation');
+    }
+
+    return paymentWithUser;
+  }
+
+  async initiateStkPush(
+    paymentId: string,
+    phone: string,
+    amount: number,
+  ): Promise<void> {
+    const accessToken = await this.getAccessToken();
+    const shortcode = this.configService.get('MPESA_SHORTCODE');
+    const passkey = this.configService.get('MPESA_PASSKEY');
+    const timestamp = new Date()
+      .toISOString()
+      .replace(/[^0-9]/g, '')
+      .slice(0, 14);
+    const password = Buffer.from(`${shortcode}${passkey}${timestamp}`).toString(
+      'base64',
+    );
+
+    const cleanPhone = phone.replace(/^\+/, '');
+    const tillNumber = this.configService.get('MPESA_TILL_NUMBER') || shortcode;
+    
+    // Use CustomerBuyGoodsOnline for Till Numbers, CustomerPayBillOnline for Paybills
+    const transactionType = tillNumber === shortcode ? 'CustomerBuyGoodsOnline' : 'CustomerPayBillOnline';
+
+    const payload = {
+      BusinessShortCode: tillNumber,
+      Password: password,
+      Timestamp: timestamp,
+      TransactionType: transactionType,
+      Amount: amount,
+      PartyA: cleanPhone,
+      PartyB: tillNumber,
+      PhoneNumber: cleanPhone,
+      CallBackURL: `${this.configService.get('MPESA_CALLBACK_URL')}/${paymentId}`,
+      AccountReference: paymentId,
+      TransactionDesc: 'Jane on the Game Subscription',
+    };
+
+    try {
+      const response = await axios.post(
+        `${this.mpesaBaseUrl}/mpesa/stkpush/v1/processrequest`,
+        payload,
+        {
+          headers: {
+            Authorization: `Bearer ${accessToken}`,
+            'Content-Type': 'application/json',
+          },
+        },
+      );
+
+      console.log('✅ STK Push initiated:', response.data);
+      console.log('📱 Sandbox test: Use phone 254708374149 or 254798374149');
+    } catch (error) {
+      console.error(
+        '❌ STK Push error:',
+        error.response?.data || error.message,
+      );
+      throw new BadRequestException('Failed to initiate payment');
+    }
+  }
+
+  async payToTillNumber(
+    userId: string,
+    amount: number,
+    tillNumber: string,
+  ): Promise<Payment> {
+    const payment = this.paymentsRepository.create({
+      userId,
+      amount,
+      type: PaymentType.WITHDRAWAL,
+      method: PaymentMethod.MPESA,
+      status: PaymentStatus.PENDING,
+      description: `Payment to till ${tillNumber}`,
+    });
+
+    const saved = await this.paymentsRepository.save(payment);
+
+    await this.initiateB2BPayment(saved.id, amount, tillNumber);
+
+    return saved;
+  }
+
+  async initiateB2BPayment(
+    paymentId: string,
+    amount: number,
+    tillNumber: string,
+  ): Promise<void> {
+    const accessToken = await this.getAccessToken();
+
+    const payload = {
+      Initiator: this.configService.get('MPESA_INITIATOR_NAME'),
+      SecurityCredential: this.configService.get('MPESA_SECURITY_CREDENTIAL'),
+      CommandID: 'BusinessBuyGoods',
+      SenderIdentifierType: '4',
+      RecieverIdentifierType: '4',
+      Amount: amount,
+      PartyA: this.configService.get('MPESA_SHORTCODE'),
+      PartyB: tillNumber,
+      AccountReference: paymentId,
+      Remarks: 'Payment from Jane on the Game',
+      QueueTimeOutURL: this.configService.get('MPESA_TIMEOUT_URL'),
+      ResultURL: `${this.configService.get('MPESA_RESULT_URL')}/${paymentId}`,
+    };
+
+    try {
+      const response = await axios.post(
+        `${this.mpesaBaseUrl}/mpesa/b2b/v1/paymentrequest`,
+        payload,
+        {
+          headers: {
+            Authorization: `Bearer ${accessToken}`,
+            'Content-Type': 'application/json',
+          },
+        },
+      );
+
+      console.log('B2B Payment initiated:', response.data);
+    } catch (error) {
+      console.error(
+        'B2B Payment error:',
+        error.response?.data || error.message,
+      );
+      throw new BadRequestException('Failed to initiate payment to till');
+    }
+  }
+
+  async handleCallback(paymentId: string, callbackData: any): Promise<Payment> {
+    console.log('📞 Handling callback for payment:', paymentId);
+    console.log('📞 Callback data:', JSON.stringify(callbackData, null, 2));
+
+    const payment = await this.paymentsRepository.findOne({
+      where: { id: paymentId },
+      relations: ['user'],
+    });
+
+    if (!payment) {
+      throw new BadRequestException('Payment not found');
+    }
+
+    // Extract result code from different possible locations
+    let resultCode;
+    if (callbackData.Body?.stkCallback?.ResultCode !== undefined) {
+      resultCode = callbackData.Body.stkCallback.ResultCode;
+    } else if (callbackData.Result?.ResultCode !== undefined) {
+      resultCode = callbackData.Result.ResultCode;
+    } else {
+      resultCode = callbackData.ResultCode;
+    }
+
+    console.log('📞 Result code:', resultCode, typeof resultCode);
+
+    if (resultCode === 0) {
+      // Payment successful
+      const transactionId =
+        callbackData.Body?.stkCallback?.CallbackMetadata?.Item?.find(
+          (item: any) => item.Name === 'MpesaReceiptNumber',
+        )?.Value || callbackData.Result?.TransactionID;
+
+      console.log('✅ Payment successful, transaction ID:', transactionId);
+
+      if (payment.type === PaymentType.DEPOSIT) {
+        await this.usersService.updateBalance(
+          payment.userId,
+          Number(payment.amount),
+        );
+        console.log('💰 Updated user balance');
+
+        // Update subscription if this is a subscription payment
+        if (payment.subscriptionPlan && payment.subscriptionDurationMonths) {
+          const now = new Date();
+          const endDate = new Date(now);
+          endDate.setMonth(
+            endDate.getMonth() + payment.subscriptionDurationMonths,
+          );
+
+          await this.usersService.update(payment.userId, {
+            subscriptionPlan: payment.subscriptionPlan,
+            subscriptionStatus: 'active',
+            subscriptionStartDate: now,
+            subscriptionEndDate: endDate,
+            subscriptionRenewalNotified: false,
+          });
+
+          console.log('🎟️ Updated user subscription:', {
+            plan: payment.subscriptionPlan,
+            duration: payment.subscriptionDurationMonths,
+            endDate: endDate.toISOString(),
+          });
+        }
+      }
+
+      payment.status = PaymentStatus.COMPLETED;
+      payment.transactionId = transactionId;
+    } else {
+      // Payment failed
+      console.log('❌ Payment failed with result code:', resultCode);
+      payment.status = PaymentStatus.FAILED;
+    }
+
+    const savedPayment = await this.paymentsRepository.save(payment);
+    console.log('💾 Payment saved with status:', savedPayment.status);
+
+    // Reload with user relation to ensure it's present
+    const paymentWithUser = await this.paymentsRepository.findOne({
+      where: { id: savedPayment.id },
+      relations: ['user'],
+    });
+
+    if (!paymentWithUser) {
+      throw new BadRequestException('Payment not found after callback');
+    }
+
+    return paymentWithUser;
+  }
+
+  async handleTimeout(paymentId: string): Promise<Payment> {
+    const payment = await this.paymentsRepository.findOne({
+      where: { id: paymentId },
+      relations: ['user'],
+    });
+
+    if (!payment) {
+      throw new BadRequestException('Payment not found');
+    }
+
+    payment.status = PaymentStatus.FAILED;
+    payment.description = 'Transaction timed out';
+
+    return this.paymentsRepository.save(payment);
+  }
+
+  async getPaymentStatus(paymentId: string): Promise<Payment> {
+    const payment = await this.paymentsRepository.findOne({
+      where: { id: paymentId },
+      relations: ['user'],
+    });
+
+    if (!payment) {
+      throw new BadRequestException('Payment not found');
+    }
+
+    return payment;
+  }
+
+  async queryTransactionStatus(checkoutRequestId: string): Promise<any> {
+    const accessToken = await this.getAccessToken();
+    const shortcode = this.configService.get('MPESA_SHORTCODE');
+    const passkey = this.configService.get('MPESA_PASSKEY');
+    const timestamp = new Date()
+      .toISOString()
+      .replace(/[^0-9]/g, '')
+      .slice(0, 14);
+    const password = Buffer.from(`${shortcode}${passkey}${timestamp}`).toString(
+      'base64',
+    );
+
+    try {
+      const response = await axios.post(
+        `${this.mpesaBaseUrl}/mpesa/stkpushquery/v1/query`,
+        {
+          BusinessShortCode: shortcode,
+          Password: password,
+          Timestamp: timestamp,
+          CheckoutRequestID: checkoutRequestId,
+        },
+        {
+          headers: {
+            Authorization: `Bearer ${accessToken}`,
+            'Content-Type': 'application/json',
+          },
+        },
+      );
+
+      return response.data;
+    } catch (error) {
+      console.error(
+        'Query transaction status error:',
+        error.response?.data || error.message,
+      );
+      throw new BadRequestException('Failed to query transaction status');
+    }
+  }
+
+  async findByUser(userId: string): Promise<Payment[]> {
+    return this.paymentsRepository.find({
+      where: { userId },
+      relations: ['user'],
+      order: { createdAt: 'DESC' },
+    });
+  }
+
+  async findAll(): Promise<Payment[]> {
+    return this.paymentsRepository.find({
+      relations: ['user'],
+      order: { createdAt: 'DESC' },
+    });
+  }
+}
