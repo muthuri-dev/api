@@ -124,6 +124,7 @@ type MessageResponse {
 type Mutation {
   applyReferralCode(referralCode: String!): Boolean!
   createPrediction(input: CreatePredictionInput!): Prediction!
+  fetchGameH2H(gameId: String!): Game!
   forgotPassword(email: String!): MessageResponse!
   generateReferralCode: String!
   initializePaystackPayment(input: InitializePaymentInput!): PaymentInitResponse!
@@ -137,7 +138,8 @@ type Mutation {
   sendPhoneOtpToCurrentUser: MessageResponse!
   sendSmsToAllUsers(message: String!): MessageResponse!
   sendSmsToUser(input: SendSmsInput!): MessageResponse!
-  syncApiFootballFixtures: SyncResult!
+  syncFootballData: MessageResponse!
+  syncFootballFixtures: SyncResult!
   updateGameStatistics(input: UpdateGameStatisticsInput!): Game!
   updateGameTip(input: UpdateGameTipInput!): Game!
   updateNotificationSettings(emailNotifications: Boolean, smsNotifications: Boolean): Boolean!

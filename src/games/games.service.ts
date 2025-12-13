@@ -4,6 +4,7 @@ import { Repository, In } from 'typeorm';
 import { Game, GameStatus } from './entities/game.entity';
 import { UpdateGameStatisticsInput } from './dto/update-game-statistics.input';
 import { UpdateGameTipInput } from './dto/update-game-tip.input';
+import axios from 'axios';
 
 @Injectable()
 export class GamesService {
@@ -124,5 +125,82 @@ export class GamesService {
       where: { isFree: true },
       order: { startTime: 'ASC' },
     });
+  }
+
+  async fetchH2HForGame(gameId: string): Promise<Game> {
+    const game = await this.findById(gameId);
+    
+    // Try to extract SofaScore event ID from externalId
+    if (game.externalId?.startsWith('sofascore-')) {
+      const eventId = parseInt(game.externalId.replace('sofascore-', ''));
+      
+      try {
+        const response = await axios.get(
+          `https://api.sofascore.com/api/v1/event/${eventId}/h2h/events`,
+          {
+            headers: {
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+              'Accept': 'application/json',
+            },
+            timeout: 10000,
+          }
+        );
+
+        if (response.data?.events) {
+          const h2hMatches = response.data.events.slice(0, 5);
+          
+          let homeWins = 0;
+          let draws = 0;
+          let awayWins = 0;
+          const lastMatches: any[] = [];
+
+          const homeTeamName = game.homeTeam.name;
+
+          for (const match of h2hMatches) {
+            const homeScore = match.homeScore?.current || 0;
+            const awayScore = match.awayScore?.current || 0;
+            const matchDate = new Date(match.startTimestamp * 1000);
+
+            const matchHomeTeam = match.homeTeam?.name;
+            const matchAwayTeam = match.awayTeam?.name;
+
+            const ourTeamWasHome = matchHomeTeam === homeTeamName;
+            const ourTeamWasAway = matchAwayTeam === homeTeamName;
+
+            if (homeScore === awayScore) {
+              draws++;
+            } else if (ourTeamWasHome && homeScore > awayScore) {
+              homeWins++;
+            } else if (ourTeamWasAway && awayScore > homeScore) {
+              homeWins++;
+            } else {
+              awayWins++;
+            }
+
+            lastMatches.push({
+              date: matchDate.toLocaleDateString(),
+              homeTeam: matchHomeTeam,
+              awayTeam: matchAwayTeam,
+              score: `${homeScore}-${awayScore}`,
+            });
+          }
+
+          await this.gamesRepository.update(gameId, {
+            headToHead: {
+              homeWins,
+              draws,
+              awayWins,
+              lastMatches,
+            },
+          });
+
+          return this.findById(gameId);
+        }
+      } catch (error) {
+        throw new Error(`Failed to fetch H2H: ${error.message}`);
+      }
+    }
+
+    throw new Error('Game does not have a SofaScore ID');
   }
 }

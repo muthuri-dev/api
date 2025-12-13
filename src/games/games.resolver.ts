@@ -2,7 +2,7 @@ import { Resolver, Query, Args, Subscription, Mutation } from '@nestjs/graphql';
 import { PubSub } from 'graphql-subscriptions';
 import { UseGuards, SetMetadata } from '@nestjs/common';
 import { GamesService } from './games.service';
-import { ApiFootballService } from './api-football.service';
+import { FootballScraperService } from './football-scraper.service';
 import { Game } from './models/game.model';
 import { SyncResult } from './models/sync-result.model';
 import { GameStatus } from './entities/game.entity';
@@ -18,7 +18,7 @@ const pubSub = new PubSub();
 export class GamesResolver {
   constructor(
     private readonly gamesService: GamesService,
-    private readonly apiFootballService: ApiFootballService,
+    private readonly footballScraperService: FootballScraperService,
   ) {}
 
   @Query(() => [Game], { name: 'liveGames' })
@@ -99,10 +99,15 @@ export class GamesResolver {
     return this.gamesService.findWithFreeTips();
   }
 
-  @Mutation(() => SyncResult, { name: 'syncApiFootballFixtures' })
+  @Mutation(() => SyncResult, { name: 'syncFootballFixtures' })
   @UseGuards(GqlAuthGuard, GqlRolesGuard)
   @SetMetadata('roles', [UserRole.ADMIN])
-  async syncApiFootballFixtures() {
-    return this.apiFootballService.manualSync();
+  async syncFootballFixtures() {
+    return this.footballScraperService.manualSync();
+  }
+
+  @Mutation(() => Game, { name: 'fetchGameH2H' })
+  async fetchGameH2H(@Args('gameId') gameId: string) {
+    return this.gamesService.fetchH2HForGame(gameId);
   }
 }

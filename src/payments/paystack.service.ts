@@ -5,18 +5,18 @@ import {
   Payment,
   PaymentStatus,
   PaymentMethod,
+  PaymentType,
 } from './entities/payment.entity';
 import { User } from '../users/entities/user.entity';
 import * as crypto from 'crypto';
-
-const Paystack = require('paystack-node');
+import axios from 'axios';
 
 @Injectable()
 export class PaystackService {
   private readonly logger = new Logger(PaystackService.name);
-  private readonly paystack: any;
   private readonly secretKey: string;
   private readonly callbackUrl: string;
+  private readonly baseUrl = 'https://api.paystack.co';
 
   constructor(
     @InjectRepository(Payment)
@@ -30,7 +30,6 @@ export class PaystackService {
     if (!this.secretKey) {
       this.logger.warn('⚠️  PAYSTACK_SECRET_KEY not set');
     } else {
-      this.paystack = new Paystack(this.secretKey);
       this.logger.log('✅ Paystack service initialized');
     }
   }
@@ -46,39 +45,75 @@ export class PaystackService {
     metadata?: any,
   ) {
     try {
+      if (!this.secretKey) {
+        throw new BadRequestException('Paystack is not configured');
+      }
+
       // Convert amount to kobo (Paystack uses lowest currency denomination)
       const amountInKobo = Math.round(amount * 100);
 
+      // Parse metadata if it's a string
+      let parsedMetadata = metadata;
+      if (typeof metadata === 'string') {
+        try {
+          parsedMetadata = JSON.parse(metadata);
+        } catch (e) {
+          parsedMetadata = {};
+        }
+      }
+
+      // Generate a valid email - sanitize phone numbers that might be in email field
+      let customerEmail = user.email;
+      
+      // Check if email is actually a phone number (starts with + or contains only digits)
+      if (customerEmail && /^[\+\d\s\-\(\)]+$/.test(customerEmail)) {
+        // Email field contains a phone number, sanitize it
+        const cleanPhone = customerEmail.replace(/[^0-9]/g, '');
+        customerEmail = `${cleanPhone}@janeonthegame.com`;
+      } else if (!customerEmail && user.phone) {
+        // No email, use phone
+        const cleanPhone = user.phone.replace(/[^0-9]/g, '');
+        customerEmail = `${cleanPhone}@janeonthegame.com`;
+      } else if (!customerEmail) {
+        // Fallback if no email or phone
+        customerEmail = `user${user.id.substring(0, 8)}@janeonthegame.com`;
+      }
+
+      // Get clean phone number for metadata
+      const cleanPhone = user.phone ? user.phone.replace(/[^0-9]/g, '') : null;
+
       const paymentData = {
-        email: user.email,
+        email: customerEmail,
         amount: amountInKobo,
-        currency: 'KES', // Kenyan Shilling
+        currency: 'KES',
         reference: this.generateReference(),
         callback_url: this.callbackUrl,
         metadata: {
           user_id: user.id,
           plan_name: planName,
-          custom_fields: [
-            {
-              display_name: 'User ID',
-              variable_name: 'user_id',
-              value: user.id,
-            },
-            {
-              display_name: 'Plan',
-              variable_name: 'plan',
-              value: planName,
-            },
-          ],
-          ...metadata,
+          phone_number: cleanPhone, // Include phone for Paystack
+          ...parsedMetadata,
         },
-        channels: ['mobile_money', 'card', 'bank', 'ussd'], // Support M-Pesa via mobile_money
+        channels: ['mobile_money', 'card', 'bank'],
       };
 
-      // Initialize transaction with Paystack
-      const response = await this.paystack.transaction.initialize(paymentData);
+      this.logger.log(`Initializing payment: ${JSON.stringify(paymentData, null, 2)}`);
 
-      if (!response.status) {
+      // Initialize transaction with Paystack using axios
+      const response = await axios.post(
+        `${this.baseUrl}/transaction/initialize`,
+        paymentData,
+        {
+          headers: {
+            Authorization: `Bearer ${this.secretKey}`,
+            'Content-Type': 'application/json',
+          },
+        },
+      );
+
+      this.logger.log(`Paystack response: ${JSON.stringify(response.data, null, 2)}`);
+
+      if (!response.data.status) {
         throw new BadRequestException('Failed to initialize payment');
       }
 
@@ -86,32 +121,38 @@ export class PaystackService {
       const payment = this.paymentsRepository.create({
         user,
         amount,
+        type: PaymentType.DEPOSIT,
         currency: 'KES',
         method: PaymentMethod.PAYSTACK,
         status: PaymentStatus.PENDING,
         reference: paymentData.reference,
+        subscriptionPlan: planName,
+        subscriptionDurationMonths: parsedMetadata?.duration_months || 1,
         metadata: {
           plan_name: planName,
-          paystack_reference: response.data.reference,
-          access_code: response.data.access_code,
+          paystack_reference: response.data.data.reference,
+          access_code: response.data.data.access_code,
         },
       });
 
       await this.paymentsRepository.save(payment);
 
       this.logger.log(
-        `Payment initialized: ${paymentData.reference} for user ${user.email}`,
+        `Payment initialized: ${paymentData.reference} for user ${user.email || user.phone}`,
       );
 
       return {
-        authorization_url: response.data.authorization_url,
-        access_code: response.data.access_code,
+        authorization_url: response.data.data.authorization_url,
+        access_code: response.data.data.access_code,
         reference: paymentData.reference,
       };
     } catch (error) {
       this.logger.error(`Failed to initialize payment: ${error.message}`);
+      if (error.response) {
+        this.logger.error(`Paystack error response: ${JSON.stringify(error.response.data, null, 2)}`);
+      }
       throw new BadRequestException(
-        `Payment initialization failed: ${error.message}`,
+        `Payment initialization failed: ${error.response?.data?.message || error.message}`,
       );
     }
   }
@@ -121,13 +162,24 @@ export class PaystackService {
    */
   async verifyTransaction(reference: string) {
     try {
-      const response = await this.paystack.transaction.verify(reference);
+      if (!this.secretKey) {
+        throw new BadRequestException('Paystack is not configured');
+      }
 
-      if (!response.status) {
+      const response = await axios.get(
+        `${this.baseUrl}/transaction/verify/${reference}`,
+        {
+          headers: {
+            Authorization: `Bearer ${this.secretKey}`,
+          },
+        },
+      );
+
+      if (!response.data.status) {
         throw new BadRequestException('Transaction verification failed');
       }
 
-      const data = response.data;
+      const data = response.data.data;
 
       // Find payment in database
       const payment = await this.paymentsRepository.findOne({
@@ -171,15 +223,31 @@ export class PaystackService {
 
       await this.paymentsRepository.save(payment);
 
-      return {
-        status: payment.status,
-        amount: payment.amount,
-        reference: payment.reference,
-        user: payment.user,
-        metadata: payment.metadata,
-      };
+      // Return the full payment entity (not a plain object)
+      return payment;
     } catch (error) {
       this.logger.error(`Transaction verification failed: ${error.message}`);
+      
+      // Try to find payment and update it to failed
+      try {
+        const payment = await this.paymentsRepository.findOne({
+          where: { reference },
+          relations: ['user'],
+        });
+        
+        if (payment) {
+          payment.status = PaymentStatus.FAILED;
+          payment.metadata = {
+            ...payment.metadata,
+            failure_reason: error.message || 'Verification failed',
+          };
+          await this.paymentsRepository.save(payment);
+          return payment;
+        }
+      } catch (e) {
+        // Ignore errors finding payment
+      }
+      
       throw new BadRequestException(`Verification failed: ${error.message}`);
     }
   }
@@ -301,8 +369,8 @@ export class PaystackService {
    */
   private generateReference(): string {
     const timestamp = Date.now();
-    const random = Math.random().toString(36).substring(2, 8);
-    return `PAY-${timestamp}-${random}`.toUpperCase();
+    const random = crypto.randomBytes(4).toString('hex').toUpperCase();
+    return `PAY-${timestamp}-${random}`;
   }
 
   /**

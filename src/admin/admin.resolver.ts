@@ -7,12 +7,16 @@ import { UserRole } from '../users/entities/user.entity';
 import { MessageResponse } from '../auth/models/message-response.model';
 import { SendSmsInput } from './dto/send-sms.input';
 import { DashboardStats } from './models/dashboard-stats.model';
+import { FootballScraperService } from '../games/football-scraper.service';
 
 @Resolver()
 @UseGuards(GqlAuthGuard, GqlRolesGuard)
 @SetMetadata('roles', [UserRole.ADMIN])
 export class AdminResolver {
-  constructor(private readonly adminService: AdminService) {}
+  constructor(
+    private readonly adminService: AdminService,
+    private readonly footballScraperService: FootballScraperService,
+  ) {}
 
   @Query(() => DashboardStats, { name: 'adminDashboard' })
   async getDashboardStats() {
@@ -35,5 +39,14 @@ export class AdminResolver {
   @Mutation(() => MessageResponse)
   async sendSmsToAllUsers(@Args('message') message: string) {
     return this.adminService.sendSmsToAllUsers(message);
+  }
+
+  @Mutation(() => MessageResponse, { name: 'syncFootballData' })
+  async syncFootballData() {
+    const result = await this.footballScraperService.manualSync();
+    return {
+      success: result.success,
+      message: result.message,
+    };
   }
 }
