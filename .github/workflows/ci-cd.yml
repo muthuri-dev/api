@@ -1,94 +1,101 @@
 name: Backend CI/CD
 
-# Trigger build
 on:
   push:
-    branches:
-      - main
-      - develop
-  pull_request:
-    branches:
-      - main
-      - develop
+    branches: [main, develop]
 
 env:
-  REGISTRY: ghcr.io
-  IMAGE_NAME: janeonthegame/janeonthegame-api
+  GH_VERSION: ${{ github.sha }}
+  REGISTRY_NAME: ghcr.io
+  REGISTRY_USER: janeonthegame
+  IMAGE_NAME: janeonthegame-api
 
 jobs:
   build-and-push:
-    runs-on: ubuntu-latest
     permissions:
-      contents: read
+      contents: write
       packages: write
-      
+    runs-on: ubuntu-latest
+
     steps:
-      - name: Checkout repository
+      - name: Checkout Code
         uses: actions/checkout@v4
 
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
           node-version: '24'
-          cache: 'npm'
 
       - name: Install dependencies
         run: npm ci
 
-      - name: Run linter
+      - name: Lint
         run: npm run lint || true
 
-      - name: Run tests
+      - name: Test
         run: npm run test || true
 
-      - name: Build application
+      - name: Build
         run: npm run build
 
-      - name: Log in to Container Registry
-        if: github.event_name != 'pull_request'
+      - name: Login to GitHub Container Registry
         uses: docker/login-action@v3
         with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
+          registry: ${{ env.REGISTRY_NAME }}
+          username: ${{ env.REGISTRY_USER }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Extract metadata for Docker
-        id: meta
+      - name: Extract metadata (tags and labels)
+        id: metadata
         uses: docker/metadata-action@v5
         with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          tags: |
-            type=raw,value=main-{{sha}},enable={{is_default_branch}}
+          images: ${{ env.REGISTRY_NAME }}/${{ env.REGISTRY_USER }}/${{ env.IMAGE_NAME }}
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Build and push Docker image
-        uses: docker/build-push-action@v5
+      - name: Build and Push Docker image
+        uses: docker/build-push-action@v6
         with:
           context: .
           file: ./Dockerfile
-          push: ${{ github.event_name != 'pull_request' }}
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          push: true
+          tags: |
+            ${{ env.REGISTRY_NAME }}/${{ env.REGISTRY_USER }}/${{ env.IMAGE_NAME }}:latest
+            ${{ env.REGISTRY_NAME }}/${{ env.REGISTRY_USER }}/${{ env.IMAGE_NAME }}:${{ env.GH_VERSION }}
+          labels: ${{ steps.metadata.outputs.labels }}
+          platforms: linux/amd64
 
-      - name: Update Helm chart with new image tag
-        if: github.ref == 'refs/heads/main'
+      - name: Output Image name
         run: |
-          git config --global user.name "github-actions[bot]"
-          git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          
-          git clone https://x-access-token:${{ secrets.K8S_REPO_TOKEN }}@github.com/janeonthegame/janeonthegame-k8s.git
-          cd janeonthegame-k8s
-          
-          SHORT_SHA="${GITHUB_SHA::7}"
-          IMAGE_TAG="main-${SHORT_SHA}"
-          sed -i "s|tag: .*|tag: \"$IMAGE_TAG\"|g" environments/production/backend-values.yaml
-          
+          echo "Image pushed to ${{ env.REGISTRY_NAME }}/${{ env.REGISTRY_USER }}/${{ env.IMAGE_NAME }}:${{ env.GH_VERSION }}"
+
+  update-manifest:
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    needs: [build-and-push]
+    steps:
+      - name: Checkout Helm Repo
+        uses: actions/checkout@v4
+        with:
+          repository: janeonthegame/janeonthegame-k8s
+          token: ${{ secrets.GITHUB_TOKEN }}
+          ref: main
+
+      - name: Setup Git Config
+        run: |
+          git config user.name "GitHub Actions"
+          git config user.email "actions@github.com"
+
+      - name: Update tag in backend-values.yaml
+        run: |
+          echo "Updating to ${{ env.GH_VERSION }}"
+          sed -i "s|tag:.*|tag: ${{ env.GH_VERSION }}|" environments/production/backend-values.yaml
+
+      - name: Commit & push if changed
+        run: |
           git add environments/production/backend-values.yaml
-          git commit -m "Update backend image to $IMAGE_TAG"
-          git push
-          
-          echo "Updated Helm chart with image tag: $IMAGE_TAG"
+          if ! git diff --cached --quiet; then
+            git commit -m "ci: bump backend image to ${{ env.GH_VERSION }} [skip ci]"
+            git push origin main
+          else
+            echo "No changes to commit."
+          fi
