@@ -1,4 +1,4 @@
-# Builder stage
+# Builder stage - Build with all dependencies
 FROM node:24-alpine AS builder
 
 WORKDIR /usr/src/app
