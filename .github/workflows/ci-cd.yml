@@ -7,7 +7,7 @@ on:
 env:
   GH_VERSION: ${{ github.sha }}
   REGISTRY_NAME: ghcr.io
-  REGISTRY_USER: janeonthegame
+  REGISTRY_USER: ${{ github.repository_owner }}
   IMAGE_NAME: janeonthegame-api
 
 jobs:
