@@ -6,7 +6,7 @@ import {
   UpdateDateColumn,
   OneToMany,
 } from 'typeorm';
-import { Prediction } from '../../predictions/entities/prediction.entity';
+import type { Prediction } from '../../predictions/entities/prediction.entity';
 
 export enum GameStatus {
   SCHEDULED = 'scheduled',
@@ -113,7 +113,7 @@ export class Game {
     }>;
   } | null;
 
-  @OneToMany(() => Prediction, (prediction) => prediction.game)
+  @OneToMany('Prediction', 'game')
   predictions: Prediction[];
 
   @CreateDateColumn()

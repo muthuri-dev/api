@@ -7,7 +7,7 @@ import {
   ManyToOne,
   JoinColumn,
 } from 'typeorm';
-import { User } from '../../users/entities/user.entity';
+import type { User } from '../../users/entities/user.entity';
 
 export enum PaymentType {
   DEPOSIT = 'deposit',
@@ -34,7 +34,7 @@ export class Payment {
   @PrimaryGeneratedColumn('uuid')
   id: string;
 
-  @ManyToOne(() => User, (user) => user.payments)
+  @ManyToOne('User', 'payments')
   @JoinColumn({ name: 'userId' })
   user: User;
 

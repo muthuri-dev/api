@@ -7,8 +7,8 @@ import {
   OneToMany,
 } from 'typeorm';
 import { Exclude } from 'class-transformer';
-import { Prediction } from '../../predictions/entities/prediction.entity';
-import { Payment } from '../../payments/entities/payment.entity';
+import type { Prediction } from '../../predictions/entities/prediction.entity';
+import type { Payment } from '../../payments/entities/payment.entity';
 
 export enum UserRole {
   USER = 'user',
@@ -124,10 +124,10 @@ export class User {
   @Column({ type: 'int', default: 0 })
   totalReferrals: number; // Count of people referred
 
-  @OneToMany(() => Prediction, (prediction) => prediction.user)
+  @OneToMany('Prediction', 'user')
   predictions: Prediction[];
 
-  @OneToMany(() => Payment, (payment) => payment.user)
+  @OneToMany('Payment', 'user')
   payments: Payment[];
 
   @CreateDateColumn()

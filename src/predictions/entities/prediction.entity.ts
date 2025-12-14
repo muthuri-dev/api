@@ -7,8 +7,8 @@ import {
   ManyToOne,
   JoinColumn,
 } from 'typeorm';
-import { User } from '../../users/entities/user.entity';
-import { Game } from '../../games/entities/game.entity';
+import type { User } from '../../users/entities/user.entity';
+import type { Game } from '../../games/entities/game.entity';
 
 export enum PredictionStatus {
   PENDING = 'pending',
@@ -28,14 +28,14 @@ export class Prediction {
   @PrimaryGeneratedColumn('uuid')
   id: string;
 
-  @ManyToOne(() => User, (user) => user.predictions)
+  @ManyToOne('User', 'predictions')
   @JoinColumn({ name: 'userId' })
   user: User;
 
   @Column({ type: 'uuid' })
   userId: string;
 
-  @ManyToOne(() => Game, (game) => game.predictions)
+  @ManyToOne('Game', 'predictions')
   @JoinColumn({ name: 'gameId' })
   game: Game;
 

@@ -1,6 +1,10 @@
 import { ObjectType, Field, ID, Float, Int } from '@nestjs/graphql';
-import { Prediction } from '../../predictions/models/prediction.model';
-import { Payment } from '../../payments/models/payment.model';
+import { forwardRef } from '@nestjs/common';
+
+// Use lazy imports to avoid circular dependencies
+const getPrediction = () =>
+  require('../../predictions/models/prediction.model').Prediction;
+const getPayment = () => require('../../payments/models/payment.model').Payment;
 
 @ObjectType()
 export class User {
